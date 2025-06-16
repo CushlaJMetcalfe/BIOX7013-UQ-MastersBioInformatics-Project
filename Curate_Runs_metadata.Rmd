@@ -1,0 +1,386 @@
+---
+title: "Runs metadata"
+author: "Cushla Metcalfe"
+date: "2024-12-12"
+output: html_document
+---
+
+Join information from Read metatdata file with Experiment metadata file to get more information on the reads and samples, for example run size, sample gender etc.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(scales)
+
+```
+
+# Read in Runs metadata
+
+```{r}
+metadata_runs <- read_csv("./Input_File/run_metadata.csv", 
+    col_types = cols(ReleaseDate = col_datetime(format = "%d/%m/%Y %H:%M"), 
+        LoadDate = col_datetime(format = "%d/%m/%Y %H:%M")))
+```
+
+```{r}
+metadata_runs %>%
+  group_by(Body_Site) %>%
+  count()
+```
+
+
+```{r}
+problems(metadata_runs)
+```
+
+# Tidy up
+
+### Function to count na values in a column
+
+```{r function to count na values in column}
+
+check_na <- function(data, columns) {
+  data %>%
+    select(all_of(columns)) %>% # Select specified columns
+    summarise(across(everything(), ~sum(is.na(.)))) %>% # Count NA values
+    pivot_longer(cols = everything(), # Reshape into two columns
+                 names_to = "Column",
+                 values_to = "NA_Count") %>%
+    mutate(Percent_NA = (NA_Count / nrow(data))*100) # Calculate percent NA
+}
+```
+
+###  Remove columns that are mostly NA
+
+```{r check columns that look like they are almost all na}
+
+cols_to_check <- c("AssemblyName", 
+                   "Study_Pubmed_id", 
+                   "g1k_pop_code", 
+                   "source", 
+                   "g1k_analysis_group", 
+                   "Affection_Status",
+                   "Histological_Type",
+                   "Disease"
+                   )
+
+check_na(metadata_runs, cols_to_check )
+
+```
+
+```{r remove columns that are mostly na}
+
+metadata_runs <- metadata_runs %>%
+  select(-(all_of(cols_to_check)))
+```
+
+### Rename columns
+
+```{r}
+colnames(metadata_runs)
+```
+
+```{r rename columns}
+
+colnames(metadata_runs) <- c("RUN.accession", "RUN.RelaseDate", "RUN.LoadDate", "RUN.total_spots",
+"RUN.total_bases", "RUN.spots_with_mates", "RUN.avgLength","SRAFile.size.size_MB",             
+"SRAFile.download_path","EXPERIMENT.accession","LIBRARY_NAME","LIBRARY_STRATEGY",      
+"LIBRARY_SELECTION", "LIBRARY_SOURCE", "LIBRARY_LAYOUT.PAIRED", "LIBRARY.InsertSize",           
+"LIBRARY.InsertDev", "LIBRARY.Platform", "ILLUMINA.INSTRUMENT_MODEL", "STUDY_REF.accession.SRAStudy",     "STUDY_REF.EXTERNAL_ID.text.BioProject", "ProjectID", "SAMPLE_DESCRIPTOR.accession", "SAMPLE_EXTERNAL_ID.text.BioSample",            
+"SampleType", "SAMPLE_NAME.TAXON_ID", "SAMPLE_ScientificName", "SAMPLE_SampleName",          
+"Subject_ID", "SAMPLE_Sex", "SAMPLE_Tumor",                
+"SAMPLE_Analyte_Type", "SAMPLE_Body_Site", "CenterName","Submission",           
+"dbgap_study_accession", "Consent", "RunHash", "ReadHash" )
+```
+
+# Check if Experiment Accessions are unqiue, i.e. if there is more than one run associated with an Experiment
+### this information is saved to a file further down
+
+```{r check if experiment accessions are unique}
+
+non_unique_experiment_accession <- metadata_runs %>%
+  count(EXPERIMENT.accession) %>%        # Count occurrences of each value
+  filter(n > 1)
+
+non_unique_experiment_accession
+
+```
+
+# Rename columns so that they have the prefix 'Run' so I know which dataset the columns come from when I join it with metadata on experiments
+
+
+```{r}
+
+colnames(metadata_runs) <- 
+  paste("Runs", colnames(metadata_runs),sep="_") 
+
+```
+
+```{r}
+colnames(metadata_runs)
+```
+
+# The Run accession number is unique
+
+```{r check if there is a column with all unique values}
+
+metadata_runs %>%
+  summarise(across(everything(), ~ n_distinct(.) == n())) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "is_unique") %>%
+  filter(is_unique) %>%
+  pull(column)
+
+```
+
+### write to file for checking joining operation (see below)
+
+```{r}
+write.csv(metadata_runs, '../2_Reads_Metadata/Output_Files/test_runs.csv', row.names = FALSE)
+```
+
+
+# Join with the Experiment Metadata
+
+```{r join with experiment metadata}
+
+metadata_WGS <- read_csv("../1_Experiment_Metadata/Output_Files/metadata_WGS_curated.csv", show_col_types = FALSE)
+```
+
+### See separate script 'Checking Joining Operation' showing how rows have been duplicated and that the number of bases from the runs metadata file is the correct value
+
+```{r}
+metadata_WGS_runs <- 
+  left_join(metadata_runs, metadata_WGS, by=c("Runs_EXPERIMENT.accession"="Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession"), relationship =
+  "many-to-many")
+
+```
+### Remove duplicate rows
+
+```{r remove duplicate rows}
+
+metadata_WGS_runs <- metadata_WGS_runs %>%
+  distinct()
+
+```
+
+
+### Reorder and remove unhelpful/duplicate columns
+
+```{r reorder columns}
+
+metadata_WGS_runs <- metadata_WGS_runs %>%
+  select("Runs_EXPERIMENT.accession",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.TITLE",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION",
+"Runs_STUDY_REF.EXTERNAL_ID.text.BioProject",
+"Runs_STUDY_REF.accession.SRAStudy",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_TITLE",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT",
+"Runs_RUN.accession",
+"Runs_RUN.RelaseDate",
+"Runs_RUN.total_bases",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases",
+"Runs_RUN.avgLength",
+"Runs_SRAFile.size.size_MB",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.size",
+"Runs_SRAFile.download_path",
+"Runs_LIBRARY_SOURCE",
+"Runs_ILLUMINA.INSTRUMENT_MODEL",
+"Runs_ProjectID",
+"Runs_SAMPLE_DESCRIPTOR.accession",
+"Runs_SAMPLE_EXTERNAL_ID.text.BioSample",
+"Runs_SampleType",
+"Runs_SAMPLE_NAME.TAXON_ID",
+"Runs_SAMPLE_ScientificName",
+"Runs_SAMPLE_SampleName",
+"Runs_Subject_ID",
+"Runs_SAMPLE_Sex",
+"Runs_SAMPLE_Tumor",
+"Runs_SAMPLE_Analyte_Type",
+"Runs_SAMPLE_Body_Site",
+"Runs_Submission",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SUBMISSION.lab_name",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SUBMISSION.center_name",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Address.City",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Address.Country",
+"Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Contact.email",
+"Runs_dbgap_study_accession")
+```
+
+### Check important columns for na values
+
+```{r}
+cols_to_check <- c("Runs_EXPERIMENT.accession",
+                   "Runs_RUN.accession",
+                   "Runs_RUN.total_bases",
+                   "Exp_EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases",
+                   "Runs_SAMPLE_DESCRIPTOR.accession",
+                   "Runs_SAMPLE_EXTERNAL_ID.text.BioSample",
+                   "Runs_STUDY_REF.accession.SRAStudy",
+                   "Runs_STUDY_REF.EXTERNAL_ID.text.BioProject"
+                   
+                   )
+
+check_na(metadata_WGS_runs, cols_to_check)
+
+```
+
+### Total bases
+
+Keep both Runs total bases and Experiment total bases
+In most records the 2 columns will be the same
+In a few records, there were 2 runs. The Runs total bases is the total for each run,
+the Experiment total bases is the total for both runs.
+
+
+### Plot of average read length
+
+```{r}
+
+p <- metadata_WGS_runs %>%
+  ggplot(aes(x = factor(1), y = Runs_RUN.avgLength/2)) +
+  geom_violin(trim = FALSE, fill = "#287D8e") +  # Violin plot
+  theme_minimal() +
+  labs(title = "Violin Plot (Av Read Length)",
+       y = "Average Read Length",
+       x = "") +  # Remove x-axis label
+  theme(axis.text.y = element_text(size=14, family="Calibri"),
+        axis.title.y = element_text(size=14, family="Calibri"),
+        axis.text.x = element_text(size=14, family="Calibri"),
+        axis.title.x = element_text(size=14, family="Calibri")) +
+  scale_y_continuous(breaks = pretty_breaks(n = 10))
+
+p
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Read_Length_alldata_ViolinPlot.tiff", plot = p, width = 10, height = 10)
+```
+
+### Check records with zero read length
+
+```{r}
+zero_read_length<- metadata_WGS_runs %>%
+  filter(Runs_RUN.avgLength == 0) 
+```
+
+```{r}
+metadata_WGS_runs %>%
+  filter((Runs_RUN.avgLength/2) != 0) %>%
+  summarize(mean=mean(Runs_RUN.avgLength/2), min=min(Runs_RUN.avgLength/2), max=max(Runs_RUN.avgLength/2))
+
+```
+
+
+
+
+### Check records with average read lengths > 450 bases
+
+```{r}
+bp450_read_length <- metadata_WGS_runs %>%
+  filter(Runs_RUN.avgLength > 450)
+
+#write.csv(bp450_read_length, #'./Output_Files/metadata_experiments_ReadLengthGT450bp.csv', row.names=FALSE )
+```
+
+```{r}
+bpLT450_read_length<- metadata_WGS_runs %>%
+  filter(Runs_RUN.avgLength < 450)
+```
+
+
+### 95% of data has > 140bases read length
+
+```{r}
+gt_140bases<- metadata_WGS_runs %>%
+  filter(Runs_RUN.avgLength >  140)
+
+(nrow(gt_140bases)/nrow(metadata_runs))*100
+```
+
+
+
+
+
+# Experiments with > 2 run accessions
+### The SRA EXPERIMENT and RUN objects contain instrument and library information and are directly associated with sequence data.
+### Each SRA EXPERIMENT (SRA accession SRX#) is a unique sequencing result for a specific sample
+### Save file with inforamtion
+
+```{r Experiments with > 2 run accessions}
+
+two_runs <- metadata_WGS_runs %>%
+  filter(duplicated(Runs_EXPERIMENT.accession) | duplicated(Runs_EXPERIMENT.accession, fromLast = TRUE)) %>%
+  select(Runs_RUN.accession, Runs_EXPERIMENT.accession, Runs_STUDY_REF.EXTERNAL_ID.text.BioProject,                                         Runs_STUDY_REF.accession.SRAStudy)
+
+write.csv(two_runs, './Output_Files/metadata_experiments_2_runs.csv')
+
+write.csv(two_runs, '../../../Analysis/Results/Tables/metadata_experiments_2_runs.csv', row.names = FALSE)
+
+```
+
+```{r}
+list_run_accessions_two_runs <- two_runs %>%
+  select(Runs_RUN.accession)
+
+list <-as.character(list_run_accessions_two_runs[[1]])
+
+writeLines(list, './Output_Files/run_accessions_experiments_2_runs.txt')
+writeLines(list, '../../../Analysis/Results/Tables/run_accessions_experiments_2_runs.txt')
+
+```
+
+### get publications for experiments with 2 run accessions
+
+```{r Get publications for Experiments with 2 run accessions}
+
+#get Experiment numbers
+
+Experiments_with_mt2runs <- two_runs %>%
+    count(Runs_STUDY_REF.accession.SRAStudy, name = 'count')
+
+Experiments_with_mt2runs
+
+```
+
+SRP002423	2	No associated publication 'Metagenomic Analysis of the Structure and Function of the Human Gut Microbiota in Crohn''s Disease'
+
+SRP064913	18 No associated publication 'Library preparation methodology can influence genomic and functional predictions in human microbiome research'
+
+SRP069867	10 'Piper HG, Fan D, Coughlin LA, Ho EX, McDaniel MM, Channabasappa N, Kim J, Kim M, Zhan X, Xie Y et al. Severe Gut Microbiota Dysbiosis Is Associated With Poor Growth in Patients With Short Bowel Syndrome. JPEN J Parenter Enteral Nutr. 2017 Sep;  41(7):1202-1212. doi: 10.1177/0148607116658762. PMID: 27406942; PMCiD.'
+	
+
+### Get total number of projects
+
+```{r}
+
+metadata_WGS_runs %>%
+  count(Runs_STUDY_REF.accession.SRAStudy, name = 'count') %>%
+  count()
+
+```
+
+
+# Write file
+
+```{r}
+write.csv(metadata_WGS_runs, 
+          './Output_Files/metadata_WGS_runs_curated.csv', row.names = FALSE)
+
+write.csv(metadata_WGS_runs, '../../../Analysis/Results/Tables/metadata_WGS_runs_curated.csv', row.names = FALSE)
+```
+
+```{r}
+metadata_WGS_runs_curated <- read_csv("C:/Users/cushl/Dropbox/UQ_MastersBioinformatics/2024_2025_BIOX_Research_Project/metadata/2_Reads_Metadata/Output_Files/metadata_WGS_runs_curated.csv")
+```
+
+# Session Information
+
+```{r Session Information}
+
+sessionInfo()
+```

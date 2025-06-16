@@ -1,0 +1,1397 @@
+---
+title: "Filter SRA Metadata for Human Gut Metagenomes"
+author: "Cushla Metcalfe"
+date: "2024-12-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Curate SRA metadata for suitable records, i.e. records that are:
+1. Whole genome sequencing.
+2. Run on Illumina Platforms with max read length > 100bp
+3. sequencing run size > 2 Gb
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(viridis)
+library(jsonlite)
+library(scales)
+
+```
+
+# Description of SRA data
+
+https://www.ncbi.nlm.nih.gov/sra/docs/submitmeta/
+
+Relations between SRA objects, data, and submissions
+The SRA publicly accessioned objects are STUDY (accession in the form of SRP#), SAMPLE (SRS#), EXPERIMENT (SRX#), RUN (SRR#). SUBMISSION has a non-public accession in the form of SRA#.
+
+The SRA EXPERIMENT and RUN objects contain instrument and library information and are directly associated with sequence data.
+
+SRA data pertaining to a STUDY can be deposited in more than one SUBMISSION.
+
+A SAMPLE can be shared between STUDIES and between SUBMISSIONS.
+
+# Read in metadata file
+
+```{r}
+
+metadata <- read_csv("./Input_Files/combined_metadata.csv", 
+    col_types = cols(`EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.@version` = col_character(),
+                     `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.@published` = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.@semantic_name` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.@supertype` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.@sratoolkit` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.Alternatives` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.@xmlns` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.Alternatives.@url` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.Alternatives.@access_type` = col_character(),
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.LS454.INSTRUMENT_MODEL` = col_character(),
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.Alternatives.@org` = col_character(), 
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.@xmlns` = col_character(),
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile.Alternatives.free_egress` = col_character(),
+        `EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.COMMON_NAME` = col_character()))
+```
+
+```{r}
+problems(metadata)
+```
+
+```{r}
+metadata_cleaned <- metadata[rowSums(is.na(metadata)) < ncol(metadata)-2, ]
+
+```
+
+# Incorrectly formatted records and columns
+
+### Identify records with mostly na columns. All the record information is in a single column 'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE'.
+
+```{r}
+# Filter the rows where 2 or fewer columns are not NA
+almost_empty_rows <- metadata[apply(metadata, 1, function(x) sum(!is.na(x)) <= 2), ]
+
+# Get logical matrix of non-NA values
+almost_empty_rows_matrix <- !is.na(almost_empty_rows)
+
+# Find columns with non-NA values
+columns_with_non_na <- colSums(almost_empty_rows_matrix) > 0  # TRUE if column has non-NA values
+
+# Get the names of the columns that contain non-NA values
+columns_with_non_na_names <- names(columns_with_non_na)[columns_with_non_na]
+
+# Print the result
+print(columns_with_non_na_names)
+
+almost_empty_rows_cols_with_entry<-almost_empty_rows[,'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE']
+
+```
+#### Get structure of entries
+
+```{r}
+# Extract the first row as text
+first_row_text <- as.character(almost_empty_rows_cols_with_entry[1, 1])
+
+# Print the result to copy and paste
+cat(first_row_text)
+```
+
+#### Retrieve Experiment and Study Information
+
+```{r}
+extract_accessions_regex <- function(text) {
+  # For EXPERIMENT accession
+  exp_matches <- regexpr("\\{'EXPERIMENT':\\s*\\{'@accession':\\s*'([^']+)'", text)
+  if (exp_matches > 0) {
+    exp_match_length <- attr(exp_matches, "match.length")
+    exp_match_text <- substr(text, exp_matches, exp_matches + exp_match_length - 1)
+    experiment_accession <- gsub(".*'@accession':\\s*'([^']+)'.*", "\\1", exp_match_text)
+  } else {
+    experiment_accession <- NA
+  }
+  
+  # For STUDY_REF accession
+  study_matches <- regexpr("STUDY_REF'.*?'@accession':\\s*'([^']+)'", text)
+  if (study_matches > 0) {
+    study_match_length <- attr(study_matches, "match.length")
+    study_match_text <- substr(text, study_matches, study_matches + study_match_length - 1)
+    study_ref_accession <- gsub(".*'@accession':\\s*'([^']+)'.*", "\\1", study_match_text)
+  } else {
+    study_ref_accession <- NA
+  }
+  
+  return(list(experiment_accession = experiment_accession, 
+              study_ref_accession = study_ref_accession))
+}
+
+```
+
+```{r}
+results <- lapply(almost_empty_rows_cols_with_entry$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE, extract_accessions_regex)  # or use extract_accessions if JSON parsing works
+
+almost_empty_rows_cols_with_entry <- almost_empty_rows_cols_with_entry %>%
+  mutate(
+    experiment_accession = sapply(results, function(x) x$experiment_accession),
+    study_ref_accession = sapply(results, function(x) x$study_ref_accession)
+  )
+```
+
+```{r}
+almost_empty_rows_cols_with_entry %>%
+  count(study_ref_accession) %>%
+  filter(n > 1)
+  
+```
+
+
+#### 572 are from a single study SRP175119 (BioProject PRJNA510571) and are Uncultured crAssphage. Described as 'Uncultured crAssphage amplicon' and library strategy is WGA 
+
+```{r}
+term_to_search <- "BioProject', '@alias': 'PRJNA510571"
+matches <- grepl(term_to_search, almost_empty_rows_cols_with_entry$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE)
+
+# Count how many times the term appears in the entire dataframe
+sum(matches)
+```
+
+#### Examine remaining entires with mostly NA
+#### remaining entry are from two Bio Projects: 
+#### 4 entries. Study: SRP130174 BioProject: PRJNA417962. Publication: Parks DH, Chuvochina M, Waite DW, Rinke C, Skarshewski A, Chaumeil PA, Hugenholtz P. A standardized bacterial taxonomy based on genome phylogeny substantially revises the tree of life. Nat Biotechnol. 2018 Nov;36(10):996-1004. doi: 10.1038/nbt.4229. Epub 2018 Aug 27. PMID: 30148503.
+#### 3 entries. Study: SRP071788 BioProject: PRJNA313232. Publication: Ormerod KL, Wood DL, Lachner N, Gellatly SL, Daly JN, Parsons JD, Dal'Molin CG, Palfreyman RW, Nielsen LK, Cooper MA, Morrison M, Hansbro PM, Hugenholtz P. Genomic characterization of the uncultured Bacteroidales family S24-7 inhabiting the guts of homeothermic animals. Microbiome. 2016 Jul 7;4(1):36. doi: 10.1186/s40168-016-0181-2. PMID: 27388460; PMCID: PMC4936053.
+
+```{r}
+non_matches <- !grepl(term_to_search, almost_empty_rows_cols_with_entry$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE)  # Replace 'Column1' with the actual column name
+
+# Extract the rows where the term doesn't appear
+remaining_almost_empty_rows <- almost_empty_rows_cols_with_entry[non_matches, ]
+```
+
+#### Count number of entries for each project
+
+```{r}
+term_to_search <- "TITLE': 'Mapped reads for uncultivated"
+matches <- grepl(term_to_search, remaining_almost_empty_rows$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE)
+
+# Count how many times the term appears in the entire dataframe
+sum(matches)
+```
+
+```{r}
+term_to_search <- "'TITLE': 'Population genome of Bacteroidales bacterium"
+matches <- grepl(term_to_search, remaining_almost_empty_rows$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE)
+
+# Count how many times the term appears in the entire dataframe
+sum(matches)
+```
+## Incorrectly formatted columns
+#### This is the BioSample information
+
+```{r}
+check <- metadata_cleaned %>%
+  select("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_ATTRIBUTES.SAMPLE_ATTRIBUTE") %>%
+  slice_head(n=3)
+as.vector(check)
+```
+
+```{r}
+check <- metadata_cleaned %>%
+  select("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.SRAFiles.SRAFile") %>%
+  slice_head(n=3)
+as.vector(check)
+```
+
+
+# Tidy up
+
+### Remove rows that are mostly NA
+
+```{r remove rows that are mostly NA, bascially the entry is just the experiment accession}
+
+# Remove rows where most values are NA (2 or less columns are not na)
+metadata_cleaned <- metadata[rowSums(is.na(metadata)) < ncol(metadata)-2, ]
+
+```
+
+### Tidy up column names, remove '\@' and '\#' which R doesn't like
+
+```{r tidy up column names}
+colnames(metadata_cleaned) <- gsub("@", "", colnames(metadata_cleaned))
+colnames(metadata_cleaned) <- gsub("#", "", colnames(metadata_cleaned))
+```
+
+## Records with duplicate experiment accesssions
+
+#### Some samples have multiple experiment accessions, these are samples that have been sequenced more than once. The number reported in assessment is after filtering 
+
+```{r count non unique experiment accessions}
+non_unique_experiment_accessions_before <- metadata_cleaned %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession) %>%        # Count occurrences of each value
+  filter(n > 1)
+
+non_unique_experiment_accessions_before
+
+```
+
+
+### List of column names
+
+```{r get list of column names}
+
+#colnames(metadata_cleaned)
+```
+
+# Determine file structure
+
+Filter for: 1. Library strategy - need whole genome sequencing, not 16S
+or other amplicon 2. Illumina instrument model - need sequence from
+models with \> max read length 3. Sequencing depth - need at least 2 Gb
+
+There are multiple columns for each variable, determine which one has
+the both complete information
+
+### Column most likely to be correct one for each variable.
+
+### For columns where there are multiple coumns possible, compare these columns with other columns that may be more complete
+
+### * indicates the column used. 
+### Study ID (SRA) has no na, Study ID (External) does.
+
+
+1.  Experiment accession 
+    [1] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession"
+2.  Experiment title
+    [4] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.TITLE"
+3.  Experiment design 
+    [9] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION"
+4.  Study IDs (SRA) 
+    *[46]"EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession" 
+    [47]"EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.PRIMARY_ID"
+    [5] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession"
+    [6] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.IDENTIFIERS.PRIMARY_ID"
+5.  Study IDs (External) 
+    *[8] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.IDENTIFIERS.EXTERNAL_ID.text"
+    [45] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.alias"
+    [50] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.EXTERNAL_ID.text"
+    [68] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_LINKS.SAMPLE_LINK.XREF_LINK.LABEL"
+6.  Sample IDs (SRA) 
+    *[10] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.accession"
+    [11] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.IDENTIFIERS.PRIMARY_ID"
+    [56] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.accession"
+    [57] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.IDENTIFIERS.PRIMARY_ID"
+    [78] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.IDENTIFIERS.PRIMARY_ID"
+7.  Sample IDs (External) 
+    *[13] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.IDENTIFIERS.EXTERNAL_ID.text"
+    [59] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.IDENTIFIERS.EXTERNAL_ID.text"
+    [80] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.IDENTIFIERS.EXTERNAL_ID.text"
+    [113] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Pool.Member.IDENTIFIERS.EXTERNAL_ID.text"
+8.  Library Instrument 
+    [19] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL"
+9.  Library Strategy 
+    [15] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY"
+10. Library Source 
+    [16] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_SOURCE"
+11. Library Layout
+    [18]"EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_LAYOUT.PAIRED"
+12. Run accession 
+    [85] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.accession"
+13. Run # Bases 
+    [75] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.bases" 
+    *[82] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases"
+    [88] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.total_bases"
+    [108] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Pool.Member.bases"
+    [124] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Bases.count"
+14. Run Published 
+    [91] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.published"
+15. Study Abstract 
+    [53] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT"
+16. Organism 
+    [65] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME"
+    [77] "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.organism"
+
+
+### Functions to select columns with the most complete data
+
+```{r Functions to select best columns to use}
+
+# Check if an of a list of columns are duplicates
+
+check_duplicate_cols <- function(data, columns) {
+  # Ensure at least two columns are provided
+  if (length(columns) < 2) {
+    stop("You must provide at least two columns to compare.")
+  }
+  
+  # Total number of rows in the dataset
+  total_rows <- nrow(data)
+  
+  # Generate pairwise comparisons
+  comparisons <- purrr::map2(
+    columns[-length(columns)],  # First column in each pair
+    columns[-1],                # Second column in each pair
+    ~ {
+      comparison_name <- paste0(.x, "_equals_", .y)
+      identical_count <- sum(data[[.x]] == data[[.y]], na.rm = TRUE)
+      identical_percentage <- round((identical_count / total_rows) * 100, 2)
+      tibble(
+        Comparison = comparison_name,
+        Identical_Rows = identical_count,
+        Identical_Percentage = identical_percentage
+      )
+    }
+  )
+  
+  # Combine results into a single dataframe
+  bind_rows(comparisons)
+}
+
+# Check if any of a list of columns have na values
+
+check_na <- function(data, columns) {
+  data %>%
+    select(all_of(columns)) %>% # Select specified columns
+    summarise(across(everything(), ~sum(is.na(.)))) %>% # Count NA values
+    pivot_longer(cols = everything(),
+                 names_to = "Column",
+                 values_to = "NA_Count") # Reshape into two columns
+}
+
+```
+
+### Check the non-duplicated columns for na or zero values
+
+```{r Check variables to see if any have na or zero values}
+
+# Columns to check
+columns_to_check <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.TITLE",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_SOURCE",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_LAYOUT.PAIRED",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.accession",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.published",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT",
+                      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION")
+
+# Run the function
+check_na(metadata_cleaned, columns_to_check)
+
+```
+
+Columns with no na values are experiment.accession, library_strategy,
+library source
+
+### Columns StudyID (SRA)
+
+```{r Coumns for StudyID}
+
+columns_for_study_sra.id <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession",
+  "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession",
+  "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.IDENTIFIERS.PRIMARY_ID",
+  "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.PRIMARY_ID")
+ 
+```
+
+#### Check that they are duplicate columns
+
+```{r StudyID (SRA) Columns check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_study_sra.id)
+
+```
+
+#### Check if any have na values
+
+```{r Study ID (SRA) Check if any have na values}
+
+check_na(metadata_cleaned, columns_for_study_sra.id )
+```
+
+#### Select column to use for StudyID (SRA). This is the SRA STUDY column with the "SRP" prefix.
+
+
+```{r Select Column to use for StudyID}
+
+col_study_sra.id <- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession"
+
+```
+
+### Columns Study ID (External)
+
+```{r Coumns for StudyID External}
+
+columns_for_study_ext.id <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.IDENTIFIERS.EXTERNAL_ID.text",
+                            "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.alias",
+                            "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.EXTERNAL_ID.text",
+                            "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_LINKS.SAMPLE_LINK.XREF_LINK.LABEL" )
+
+ 
+```
+
+#### Check that they are duplicate columns
+
+```{r StudyID Columns check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_study_ext.id)
+
+```
+
+#### Check if any have na values
+
+```{r Study ID (External) Check if any have na values}
+
+check_na(metadata_cleaned, columns_for_study_ext.id )
+```
+
+#### Select Column for StudyID (External)
+
+```{r Select Column to use for StudyID External}
+
+col_study_ext.id <- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.alias"
+
+```
+
+### Columns Sample ID (SRA)
+
+```{r columns for sampleid SRA}
+
+columns_for_sample_SRA.id <- c('EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.accession',
+        'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.IDENTIFIERS.PRIMARY_ID',
+        'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.accession',
+        'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.IDENTIFIERS.PRIMARY_ID',
+        'EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.IDENTIFIERS.PRIMARY_ID')
+```
+
+#### Check that they are duplicate columns
+
+```{r Columns for sample ID SRA check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_sample_SRA.id)
+
+```
+
+#### Check if any have na values
+
+```{r Sample ID (SRA) Check if any have na values}
+
+check_na(metadata_cleaned, columns_for_sample_SRA.id )
+```
+
+#### Select Column for SampleID (SRA). This is the SRA SAMPLE with SRS# prefix
+
+```{r Select Column to use SampleID SRA}
+
+col_sample_sra.id <- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.accession"
+
+```
+
+### Columns SampleID (External)
+
+```{r columns for sampleid External}
+
+columns_for_sample_Ext.id <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.IDENTIFIERS.EXTERNAL_ID.text",
+                               "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.IDENTIFIERS.EXTERNAL_ID.text",
+                               "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.IDENTIFIERS.EXTERNAL_ID.text", 
+                               "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Pool.Member.IDENTIFIERS.EXTERNAL_ID.text"  )
+```
+
+#### Check that they are duplicate columns
+
+```{r Columns for sample ID External check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_sample_Ext.id)
+
+```
+
+#### Check if any have na values
+
+```{r Sample ID (External) Check if any have na values}
+
+check_na(metadata_cleaned, columns_for_sample_Ext.id )
+```
+
+#### Select Column for SampleID (External)
+
+```{r Select Column to use SampleID External}
+
+col_sample_Ext.id <- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.IDENTIFIERS.EXTERNAL_ID.text"
+```
+
+### Columns Run #Bases
+
+```{r Run #Bases Columns}
+
+# Specify columns to compare
+columns_for_Bases <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.bases", 
+                        "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases", 
+                        "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.total_bases",
+                        "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Pool.Member.bases",
+                        "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.Bases.count")
+```
+
+#### Check that they are duplicate columns
+
+```{r Run #Bases Columns check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_Bases)
+
+```
+
+#### Check if any columns have zero values
+
+```{r check if there entries for Run #bases that are zero}
+
+# Select specific columns (e.g., col1 and col3)
+selected_columns <- metadata_cleaned[, columns_for_Bases]
+
+# Count the number of rows with zero in each selected column
+sapply(selected_columns, function(x) sum(x == 0, na.rm = TRUE))
+
+```
+
+#### Check if any columns have na values
+
+```{r check if there entries for Run #bases that have na values}
+
+check_na(metadata_cleaned, columns_for_Bases)
+
+```
+
+There is no column that doesnt either have zero or na values
+
+#### Select column to use for Bases
+
+```{r Select Column to use for Bases}
+
+#Use column with no na values
+
+col_study_bases<- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases"
+
+```
+
+### Columns Organism
+
+```{r columns for Organism}
+
+columns_for_organism <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME",
+                               "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Pool.Member.organism")
+```
+
+#### Check that they are duplicate columns
+
+```{r Columns for Organism check if they are duplicates}
+
+check_duplicate_cols(metadata_cleaned, columns_for_organism )
+
+```
+
+#### Check if any have na values
+
+```{r Organism column Check if any have na values}
+
+check_na(metadata_cleaned, columns_for_organism  )
+```
+
+#### Select Column for Organism
+
+```{r Select Column to use for Organism}
+
+col_organism <- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME"
+```
+
+# Filter according to library strategy
+
+```{r Summary of library strategies}
+metadata_cleaned %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY, name = 'count')
+
+```
+
+### Function to subset data and create list of dataframes
+
+```{r function to subset data by strategy and create list of dataframes}
+
+
+subset_library_strategies <- function(data, column_name) {
+  # Get unique library strategies (including NA)
+  unique_strategies <- unique(data[[column_name]])
+  
+  # Create a list to store subsets
+  subsets <- list()
+  
+  # Loop through each strategy and subset the data
+  for (strategy in unique_strategies) {
+    # Use NA-safe filtering
+    if (is.na(strategy)) {
+      subsets[["NA"]] <- subset(data, is.na(data[[column_name]]))
+    } else {
+      subsets[[strategy]] <- subset(data, data[[column_name]] == strategy)
+    }
+  }
+  
+  # Return the list of subsets
+  return(subsets)
+}
+
+```
+
+### Subset data by strategy and create list of dfs
+
+```{r subset data by strategy}
+
+strategies_list_df <- subset_library_strategies(
+  data = metadata_cleaned,
+  column_name = "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY"
+)
+```
+
+# Save Whole Genome Sequencing metadata
+
+```{r}
+metadata_WGS <- strategies_list_df[["WGS"]]
+write.csv(metadata_WGS, './Input_Files/metadata_WGS.csv', row.names=FALSE)
+```
+
+### Remove WGS data from list of dfs and save as separate df
+
+```{r remove WGS data from list of dfs}
+
+#Function to remove a specific DataFrame from the list by its name
+
+remove_dataframe_by_name <- function(dfs_list, name_to_remove) {
+  # Use list subseting to remove the element by name
+  dfs_list <- dfs_list[!names(dfs_list) %in% name_to_remove]
+  return(dfs_list)
+}
+
+# Remove and save WGS
+strategies_list_df <- remove_dataframe_by_name(strategies_list_df, "WGS")  # Removes the DataFrame named "NA"
+```
+
+### Check all data other than WGS is really not WGS. Extract the terms 'PCR' and '16S' (most commonly used terms for amlicons, from the two columns, abstract and design description. 
+
+```{r}
+
+# Function to extract a term from specified columns (case-insensitive)
+
+extract_term <- function(row, term) {
+  regex_pattern <- paste0("(?i)", term) # Case-insensitive regex
+  matches <- unlist(regmatches(row, gregexpr(regex_pattern, row)))
+  if (length(matches) > 0) {
+    return(matches[1])  # Return the first match
+  } else {
+    return(NA)  # Return NA if no match found
+  }
+}
+
+# function to process the list of dataframes
+
+process_dataframe <- function(df) {
+  if ("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT" %in% colnames(df) &&
+      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession" %in% colnames(df) &&
+      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION" %in% colnames(df)) {
+    
+    # Define the columns to search for the term '16S' or 'PCR'
+    cols <- c(
+      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT",
+      "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION"
+    )
+    
+    # Perform the grouping, counting, and ribosomal extraction
+    result <- df %>%
+      rowwise() %>% # Apply row-wise operation
+      mutate(
+        ribosomal = extract_term(c_across(all_of(cols)), "16S"),
+        PCR = extract_term(c_across(all_of(cols)), "PCR")
+      ) %>%
+      ungroup() %>% # Remove rowwise grouping
+      group_by(
+        EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession,
+        EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION,
+        EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT,
+        ribosomal,
+        PCR  # Include PCR in the grouping
+      ) %>%
+      summarise(
+        count = n(),
+        .groups = 'drop'  # To avoid grouped_df output
+      )
+    
+    return(result)
+  } else {
+    # Return NULL if required columns are missing
+    return(NULL)
+  }
+}
+
+
+```
+
+```{r}
+# Apply the function to each dataframe in the list
+strategies_sum_by_study_listdf <- lapply(strategies_list_df, process_dataframe)
+```
+
+### Flatten list of dfs and select rows where both PCR and 16S are na
+
+```{r function to Flatten list of dfs and select rows where both PCR and 16S are na }
+
+flatten_and_filter <- function(dfs_list) {
+  # Flatten and add the DataFrame name as a column
+  flattened <- bind_rows(
+    lapply(names(dfs_list), function(df_name) {
+      dfs_list[[df_name]] %>%
+        mutate(df_name = df_name) # Add the name of the DataFrame as a column
+    }),
+    .id = "source" # Add source ID if needed for debugging
+  )
+  
+  # Filter rows where both ribosomal and PCR are NA
+  filtered <- flattened %>%
+    filter(is.na(ribosomal) & is.na(PCR))
+  
+  return(filtered)
+}
+```
+
+```{r apply function to strategies dfs}
+
+strategies_by_study_tocheck <- flatten_and_filter(strategies_sum_by_study_listdf)
+
+write.csv(strategies_by_study_tocheck, './Intermediate_Files/metadata_strategies_by_study_tocheck.csv')
+```
+
+Checked csv manually. No studies identified as mislabeled and should be included
+
+# Read in WGS metadata and get necessary column names
+
+```{r}
+#metadata_WGS <- read_csv("./Intermediate_Files/metadata_WGS.csv", show_col_types = FALSE)
+
+#col_study_bases<- "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases"
+```
+
+```{r}
+problems(metadata_WGS)
+```
+
+### Check there is only one strategy (i.e. WGS)
+
+```{r check there is only one strategy in WGS metadata}
+metadata_WGS %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY, name = 'count')
+
+```
+
+# Filter by instrument model and sequencing type
+
+```{r Counts for each model}
+metadata_WGS %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL, name = 'count')
+
+```
+
+### List of models and max length of reads
+
+<https://knowledge.illumina.com/instrumentation/general/instrumentation-general-reference_material-list/000002826>
+
+HiSeq X Ten (10 HiSeq X systems) 2 x 151bp 
+Illumina HiSeq 1000 2 x 251bp 
+Illumina HiSeq 2000 2 x 251 bp 
+Illumina HiSeq 2500 2 x 251 bp
+Illumina HiSeq 3000 2 x 151 bp 
+Illumina HiSeq 4000 2 x 151 bp Illumina
+MiSeq 309 2 x 301 bp (v3 = 300 series?) 
+Illumina NovaSeq 6000 2 x 251 bp
+NextSeq 500 2 x 151 bp
+
+<chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/https://www.illumina.com/content/dam/illumina-marketing/documents/products/specifications/specification_genome_analyzer.pdf>
+
+Illumina Genome Analyzer II 2 x 75 bp
+
+<chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/https://www.illumina.com/documents/products/datasheets/datasheet_hiscansq.pdf>
+
+Illumina HiScanSQ 2 x 100 bp
+
+### Create df with Illumina model information
+
+```{r}
+illumina_models <- data.frame(
+  model = c('HiSeq X Ten',	
+            'Illumina Genome Analyzer II',	
+            'Illumina Genome Analyzer IIx',
+            'Illumina HiScanSQ',
+            'Illumina HiSeq 1000',
+            'Illumina HiSeq 2000',
+            'Illumina HiSeq 2500',
+            'Illumina HiSeq 3000',
+            'Illumina HiSeq 4000',
+            'Illumina MiSeq',
+            'Illumina NovaSeq 6000',
+            'NextSeq 500'),
+  min_read_length = c(151, 75, 75, 100, 251, 251, 251, 151, 151, 301, 251, 151)
+
+)
+```
+
+
+### Find studies for model is NA
+
+```{r}
+cols_to_check <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL")
+
+metadata_WGS[apply(metadata_WGS[cols_to_check], 1, function(x) all(is.na(x) | x == 0)), ] %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.PRIMARY_ID, name = 'count')
+```
+This is a 454 study
+
+### Filter for models with max read length <= 100 bp and remove 454 studies
+
+```{r filter for models with max read length less 100 bp}
+
+metadata_WGS_filter_models <- metadata_WGS %>% 
+  filter(!EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL %in% 
+           c("Illumina Genome Analyzer II", "Illumina Genome Analyzer IIx", "Illumina HiScanSQ")) %>%
+  filter(!is.na(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL))
+
+print('% data kept')
+(nrow(metadata_WGS_filter_models))/(nrow(metadata_WGS))*100
+```
+
+# Filter by number of bases
+
+### Find experiments with zero or na bases
+
+```{r find experiments with zero or na bases}
+
+cols_to_check <- c(col_study_bases)
+
+# Filter rows and count occurrences
+filtered_counts <- metadata_WGS_filter_models[apply(metadata_WGS_filter_models[cols_to_check], 1, function(x) all(is.na(x) | x == 0)), ] %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.IDENTIFIERS.PRIMARY_ID, name = 'count') 
+
+# Calculate the total count
+total_counts <- sum(filtered_counts$count)
+total <-sum(total_counts)
+
+# Display the filtered counts and the total
+list(filtered_counts = filtered_counts, total_counts = total_counts,total)
+```
+
+4 studies
+
+ERP005534 130\
+ERP013933 192\
+ERP023788 20\
+ERP110757 1
+
+```{r check some of the experiments with zero or na bases}
+
+metadata_WGS_filter_models[apply(metadata_WGS_filter_models[cols_to_check], 1, function(x) all(is.na(x) | x == 0)), ] %>%
+  select(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession,EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases )
+
+# checked couple on NIH, really have zero or 'unavailable' bases 
+```
+
+```{r Add column for bases in Gb}
+
+metadata_WGS_filter_models$EXPERIMENT_PACKAGE.RUN_SET.bases_Gb <- metadata_WGS_filter_models$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases/1e9
+```
+
+### Plot number of bases
+
+```{r violin and box plot of number of bases}
+
+p <- metadata_WGS_filter_models %>%
+  #filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb < 20) %>%
+  ggplot(aes(x = factor(1), 
+             y = EXPERIMENT_PACKAGE.RUN_SET.bases_Gb,
+             fill=factor(1))) +
+  geom_violin(trim = FALSE, fill = '#463373', alpha=0.8) +  # Violin plot
+  geom_boxplot(width=0.05, color="black", fill='white') +
+  scale_y_continuous(breaks = seq(0, 20, by = 2)) +
+  theme_minimal() +
+  labs(title = "Violin Plot (Gb)",
+       y = "Gb",
+       x = "") +  # Remove x-axis label
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=22),
+        legend.position = "none",
+        axis.title.y=element_text(size=22))
+p
+
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Metadata_ViolinPlot_NoGBases.tiff", plot = p, width = 10, height = 10)
+```
+
+### Try log10 y axis
+
+```{r}
+metadata_WGS_filter_models %>%
+  filter (EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  #select(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb) %>%
+  summarise(mean=mean(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb), min=min(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb), max=max(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb))
+```
+
+```{r}
+bases <- metadata_WGS_filter_models %>%
+  filter (EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  select(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb, EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession)
+```
+
+```{r violin and box plot of number of bases}
+
+p <- metadata_WGS_filter_models %>%
+  #filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb < 20) %>%
+  filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  ggplot(aes(x = factor(1), 
+             y = EXPERIMENT_PACKAGE.RUN_SET.bases_Gb,
+             fill=factor(1))) +
+  geom_violin(trim = FALSE, fill = '#440154', alpha=0.8) +  # Violin plot
+  geom_boxplot(width=0.05, color="black", fill='white') +
+  scale_y_continuous( trans='log10', 
+                      breaks= 10^seq(-4, 3, by=0.5),
+                      labels=label_number(accuracy = 0.001, scale_cut = cut_short_scale())) +
+  theme_minimal() +
+  labs(title = "Violin Plot (Gb)",
+       y = "Gb",
+       x = "") +  # Remove x-axis label
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=12),
+        legend.position = "none",
+        axis.title.y=element_text(size=22))
+p
+
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Metadata_ViolinPlot_NoGBases_before.tiff", plot = p, width = 10, height = 10)
+```
+
+### Try a beeswarm plot
+
+```{r beeswarm and box plot of number of bases}
+
+library(ggbeeswarm)
+
+# Load required package (install if necessary)
+# install.packages("ggbeeswarm")
+library(ggbeeswarm)
+
+p <- metadata_WGS_filter_models %>%
+  filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb <= 20) %>%
+  ggplot(aes(x = factor(1), 
+             y = EXPERIMENT_PACKAGE.RUN_SET.bases_Gb)) +
+  geom_beeswarm(cex = 2, color = '#238a8d') +
+  geom_boxplot(width=1, color="black", fill='#29Af7f', outlier.shape = 17) + 
+  scale_y_continuous(breaks = seq(0, 20, by = 2)) + 
+  theme_minimal() +
+  labs(title = "Beeswarm Plot (Gb)",
+       y = "Gb",
+       x = "") +  # Remove x-axis label
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=12),
+        legend.position = "none")
+p
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Metadata_BeeSwarmPlot_NoGBases.tiff", plot = p, width = 10, height = 10)
+```
+
+#### Look at Illumina sequencing model and Sequencing run # Gb
+
+```{r}
+analyse_models_RunGb <- metadata_WGS_filter_models %>%
+  select(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession,
+         EXPERIMENT_PACKAGE.RUN_SET.bases_Gb,
+         EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL) %>%
+  left_join(illumina_models, by=c('EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL'= 'model'))
+
+colnames(analyse_models_RunGb) <- c("experiment", 'Gb', 'model', 'min_read_length')
+  
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Create a custom binning function for Gb values
+df <- analyse_models_RunGb %>%
+  #filter(Gb > 2) %>%
+  mutate(gb_bin = case_when(
+    Gb >= 0 & Gb < 2 ~ "0-2",
+    Gb >= 2 & Gb < 4 ~ "2-4",
+    Gb >= 4 & Gb < 6 ~ "4-6",
+    Gb >= 6 & Gb < 8 ~ "6-8",
+    Gb >= 8 & Gb < 10 ~ "8-10",
+    Gb >= 10 & Gb < 20 ~ "10-20",
+    Gb >= 20 & Gb < 40 ~ "20-40",
+    Gb >= 40 & Gb < 60 ~ "40-60",
+    Gb >= 60 & Gb < 80 ~ "60-80",
+    Gb >= 80 ~ "80+",
+    TRUE ~ "Other"
+  )) %>%
+  # Convert to factor to maintain the order in the plot
+  mutate(gb_bin = factor(gb_bin, levels = c("0-2", "2-4", "4-6",  
+                                           "6-8", "8-10", "10-20", 
+                                           "20-40", "40-60", "60-80", "80+")))
+
+# Group by gb_bin and model to count experiments
+count_data <- df %>%
+  group_by(gb_bin, model) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Get model order based on frequency in the first bin (0-1)
+model_order <- count_data %>%
+  filter(gb_bin == "0-2") %>%
+  arrange(desc(count)) %>%
+  pull(model)
+
+# If some models don't appear in the first bin, add them to the end of the order
+all_models <- unique(count_data$model)
+missing_models <- setdiff(all_models, model_order)
+model_order <- c(model_order, missing_models)
+
+# Convert model to a factor with the custom order
+count_data <- count_data %>%
+  mutate(model = factor(model, levels = model_order))
+
+# Create the bar chart
+p <- ggplot(count_data, aes(x = gb_bin, y = count, fill = model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() + 
+  labs(title = "Number of Experiments by Gb Range and Model",
+       x = "Gb Range",
+       y = "Number of Experiments",
+       fill = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+p
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Metadata_Gb_vs_model.tiff", plot = p, width = 10, height = 10)
+```
+
+### Remove entries with less than 2 Gb, keep entries with # bases is zero/na
+
+```{r Remove entries with less than 2 Gb, keep entries with #bases is na or zero}
+
+#metadata_WGS_filter_size <- metadata_WGS_filter_models %>% 
+#  filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb> 2)
+
+metadata_WGS_filter_size <- metadata_WGS_filter_models %>% 
+  filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb > 2 | is.na(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb) | EXPERIMENT_PACKAGE.RUN_SET.bases_Gb == 0)
+
+print('% data kept')
+(nrow(metadata_WGS_filter_size))/(nrow(metadata_WGS))*100
+
+```
+
+### Violin Plot after filtering for entries less than 2 Gb
+
+```{r violin and box plot of number of bases}
+
+p <- metadata_WGS_filter_size %>%
+  filter(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  ggplot(aes(x = factor(1), 
+             y = EXPERIMENT_PACKAGE.RUN_SET.bases_Gb,
+             fill=factor(1))) +
+  geom_violin(trim = FALSE, fill = '#32658e', alpha=0.8) +  # Violin plot
+  geom_boxplot(width=0.05, color="black", fill='white') +
+  scale_y_continuous( trans='log10', 
+                      limits = c(2, NA),
+                      breaks= 10^seq(0, 3, by=0.1),
+                      labels=label_number(accuracy = 0.001, scale_cut = cut_short_scale())) +
+    theme_minimal() +
+  labs(title = "Violin Plot (Gb)",
+       y = "Gb",
+       x = "") +  # Remove x-axis label
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=12),
+        legend.position = "none",
+        axis.title.y=element_text(size=22))
+p
+
+
+ggsave("../../Assessment/6_Report_Assessment_09_06_2025/Diagrams/Final_Tiff_Files/Metadata_ViolinPlot_NoGBases_after.tiff", plot = p, width = 10, height = 10)
+```
+```{r}
+metadata_WGS_filter_size %>%
+  filter (EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  #select(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb) %>%
+  summarise(mean=mean(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb), min=min(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb), max=max(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb))
+```
+
+```{r}
+bases_after <- metadata_WGS_filter_size %>%
+  filter (EXPERIMENT_PACKAGE.RUN_SET.bases_Gb != 0) %>%
+  select(EXPERIMENT_PACKAGE.RUN_SET.bases_Gb, EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession)
+```
+
+# Check samples that have mulitple experiment accessions
+
+```{r count non unique experiment accessions}
+non_unique_experiment_accessions <- metadata_WGS_filter_models %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession) %>%        # Count occurrences of each value
+  filter(n > 1)
+
+non_unique_experiment_accessions
+
+```
+
+These are entries with more than 1 run associated with a sample 
+
+### Check I haven't lost samples that were sequencing more than once.
+
+```{r compare non unique experiment accessions before and aftr filtering for number of bases}
+
+non_unique_experiment_accessions_after<- metadata_WGS_filter_size %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession) %>%        # Count occurrences of each value
+  filter(n > 1)
+
+identical(non_unique_experiment_accessions_after, non_unique_experiment_accessions_before)
+
+```
+
+# Check Abstracts for further information on study and on health of human donors
+
+```{r}
+#select unique studies
+
+ metadata_WGS_filter_size %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession, name = 'count')
+
+```
+
+```{r}
+
+Abstracts <- metadata_WGS_filter_size %>%
+  distinct(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession, .keep_all = TRUE) %>%
+  select(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession, 
+         EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT)
+
+```
+
+### Write abstracts as csv
+
+```{r}
+write.csv(Abstracts, './Intermediate_Files/Metadata_check_Abstracts.csv', row.names=FALSE)
+```
+
+Result: Checked csv file manually. All experiments would appear to include healthy individuals. 
+No records to be removed.
+
+# Check if all entires have a Read accession number
+
+### Find entries with no read accession
+
+```{r Find entries with no read accession}
+
+cols_to_check = c('EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.accession')
+
+metadata_WGS_filter_size[apply(metadata_WGS_filter_size[cols_to_check], 1, function(x) all(is.na(x) | x == 0)), ]
+
+```
+
+```{r Some of these also have two experiment entries}
+
+non_unique_experiment_accessions_before
+```
+
+### Write as csv file
+
+```{r write csv file of entries with no read accession}
+
+no_read_accession <- metadata_WGS_filter_size[apply(metadata_WGS_filter_size[cols_to_check], 1, function(x) all(is.na(x) | x == 0)), ]
+
+write.csv(no_read_accession, './Intermediate_Files/metadata_WGS_no_read_accession.csv')
+
+```
+
+These entries have data in SRA website. Find column with information
+Checked entries in excel. Data is in column 205. [205]
+"EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN"\
+Data is in JSON-like structure
+
+```{r}
+
+example <- metadata_WGS_filter_size %>%
+  subset (EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession == 'SRX148629') %>%
+  select (EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN)
+
+print (example)
+```
+
+### Create new column with all run accession numbers
+
+Tried to do this. Unsuccessfully. Some of the entries have one run
+accession number and some have two. The Run accession numbers were included in the read sequence metadata downloaded and joined to the current data in the 'Curate_Runs_metadata.Rmd'.
+
+# There is no unique identifier
+
+```{r check if any column has unique data}
+
+metadata_WGS_filter_size %>%
+  summarise(across(everything(), ~ n_distinct(.) == n())) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "is_unique") %>%
+  filter(is_unique) %>%
+  pull(column)
+
+```
+
+There is no column with unique data
+
+### Check if any of the experiments with all the information in a single column are in the final cuated dataset
+
+```{r}
+SRP071788_all_exp <- metadata_WGS_filter_size %>%
+  filter(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession == "SRP071788")
+
+SRP130174_all_exp <- metadata_WGS_filter_size %>%
+  filter(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession == "SRP13017")
+
+SRP175119_all_exp <- metadata_WGS_filter_size %>%
+  filter(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession == "SRP175119")
+
+```
+
+# Count and check if all samples are human in origin
+
+### Look at list of unique sample names
+
+```{r check all samples are from humans }
+
+metadata_WGS_filter_size %>%
+  count(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME, name = 'count')
+
+```
+
+### Summarize by study and get study title
+
+```{r }
+
+# Get the unique sample names from the dataframe
+unique_sample_names <- unique(metadata_WGS_filter_size$EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME)
+
+# Loop through each scientific name and calculate the count
+study_bysampletype_list <- lapply(unique_sample_names, function(sample_name) {
+  metadata_WGS_filter_size %>%
+    subset(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME == sample_name) %>%
+    count(
+      EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession,
+      EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_TITLE,
+      name = 'count'
+    ) %>%
+    mutate(sample_name = sample_name)  # Add the scientific name to the output
+})
+
+# Combine the results into a single dataframe (optional)
+study_bysampletype_df <- do.call(rbind, study_bysampletype_list)
+
+write.csv(study_bysampletype_df, './Intermediate_Files/Metadata_check_all_studies_are_human.csv')
+
+```
+
+### Get experiment and abstract information for 'metagenome' and 'gut metagenome' and NA
+
+```{r}
+study_bysample_typeNA <-metadata_WGS_filter_size %>%
+  subset(is.na(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME)) %>%
+  select(EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.accession,
+      EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_TITLE, EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT)
+```
+
+# List of experiments accessions to get read sequence data for
+
+```{r as a csv file}
+
+csv_final_experiments <- unique(metadata_WGS_filter_size$"EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession")
+
+
+# write.table(csv_final_experiments, file = './Output_Files/csv_final_experiments_from_metadata.csv', col.names = FALSE, row.names = FALSE, sep = ",")
+
+```
+
+# Curated WGS data with reduced number of columns
+
+```{r }
+
+cols_to_use <- c("EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.accession",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.TITLE",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.DESIGN_DESCRIPTION",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.accession",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.STUDY_REF.IDENTIFIERS.EXTERNAL_ID.text",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_TITLE",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.STUDY.DESCRIPTOR.STUDY_ABSTRACT",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.accession",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.SAMPLE_DESCRIPTOR.IDENTIFIERS.EXTERNAL_ID.text",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SAMPLE.SAMPLE_NAME.SCIENTIFIC_NAME",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.PLATFORM.ILLUMINA.INSTRUMENT_MODEL",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_STRATEGY",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.EXPERIMENT.DESIGN.LIBRARY_DESCRIPTOR.LIBRARY_SOURCE",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.accession",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.bases",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.size",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.RUN_SET.RUN.published",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SUBMISSION.lab_name",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.SUBMISSION.center_name",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Address.City",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Address.Country",
+                "EXPERIMENT_PACKAGE_SET.EXPERIMENT_PACKAGE.Organization.Contact.email"
+                )
+
+metadata_WGS_curated <- metadata_WGS_filter_size %>%
+  select(all_of(cols_to_use))
+```
+
+### Save file
+
+```{r add 'Exp' to colnames so I know where columns have come from}
+
+colnames(metadata_WGS_curated) <- 
+  paste("Exp", colnames(metadata_WGS_curated),sep="_") 
+
+# write.csv(metadata_WGS_curated, './Output_Files/metadata_WGS_curated.csv', row.names = FALSE)
+# 
+# write.csv(metadata_WGS_curated, '../../../Analysis/Results/Tables/metadata_WGS_curated.csv', row.names = FALSE)
+
+```
+
+### Table of numbers at each step 
+
+```{r Table of numbers at each step}
+df_names <- ls(pattern = "^metadata")
+df_list <- mget(df_names)
+
+df_list <- Filter(is.data.frame, df_list)
+
+summary_table <- data.frame(
+  DataFrame = names(df_list),
+  Observations = sapply(df_list, nrow)
+)
+
+write.csv(summary_table, './Output_Files/metadata_WGS_summary_totals_EachStep.csv', row.names=FALSE)
+ 
+write.csv(summary_table, '../../../Analysis/Results/Tables/metadata_WGS_totals_EachStep.csv', row.names = FALSE)
+
+```
+
+# Session Information
+
+```{r Session Information}
+
+sessionInfo()
+```
+
+
